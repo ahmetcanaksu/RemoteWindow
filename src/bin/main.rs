@@ -1,4 +1,3 @@
-use captrs::*;
 use core::time::Duration;
 use std::fs::File;
 use std::io::ErrorKind::WouldBlock;
@@ -6,6 +5,7 @@ use std::io::Write;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::{thread, time};
 
+/*
 fn handle_client(mut stream: TcpStream) {
     let mut capturer = Capturer::new(0).unwrap();
     let (w, h) = capturer.geometry();
@@ -49,20 +49,25 @@ fn handle_client(mut stream: TcpStream) {
         //thread::sleep(Duration::from_millis(10));
     }
 }
+*/
 
 fn main() {
-    let listener = TcpListener::bind("localhost:80");
-    if let Ok(socket) = listener {
-        for stream in socket.incoming() {
-            match stream {
-                Err(e) => println!("Accept err {}", e),
-                Ok(stream) => {
-                    thread::spawn(|| handle_client(stream));
-                }
-            }
-            //handle_client(stream.unwrap());
-        }
-    } else if let Err(error) = listener {
-        println!("Failed to bind server: {:#?}", error);
+    println!("Starting server...");
+    let displays = scrap::Display::all().unwrap();
+    println!("Available displays:");
+    for (i, display) in displays.iter().enumerate() {
+        println!("{}: {}x{}", i, display.width(), display.height());
     }
+    let display = scrap::Display::primary().unwrap();
+    let mut inner = scrap::Capturer::new(display).unwrap();
+    let frame = loop {
+        match inner.frame() {
+            Ok(frame) => break frame,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("capture error: {}", e),
+        }
+    };
+    println!("Capturer created for primary display: {}x{}", frame.len(), frame.len());
 }

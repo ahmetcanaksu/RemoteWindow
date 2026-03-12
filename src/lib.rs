@@ -1,3 +1,6 @@
+pub mod capture;
+pub mod connection;
+
 #[derive(Copy, Clone, Debug)]
 pub struct Color {
     pub red: u32,
