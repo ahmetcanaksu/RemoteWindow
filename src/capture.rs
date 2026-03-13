@@ -1,5 +1,8 @@
 use std::io;
 
+#[cfg(target_os = "macos")]
+use std::ffi::{c_char, c_void, CStr};
+
 pub trait ScreenCapturer {
     fn geometry(&self) -> (u32, u32);
     fn capture_frame(&mut self) -> io::Result<Vec<u32>>;
@@ -16,7 +19,21 @@ fn platform_create_default_capturer() -> io::Result<Box<dyn ScreenCapturer>> {
 
 #[cfg(target_os = "macos")]
 fn platform_create_default_capturer() -> io::Result<Box<dyn ScreenCapturer>> {
-    Ok(Box::new(ScrapCapturer::new()?))
+    match macos_capture_backend_from_env() {
+        MacosCaptureBackend::Auto => match SwiftCapturer::new() {
+            Ok(capturer) => Ok(Box::new(capturer)),
+            Err(err) => {
+                println!(
+                    "[server] Swift ScreenCaptureKit backend failed: {}",
+                    err
+                );
+                println!("[server] falling back to scrap backend");
+                Ok(Box::new(ScrapCapturer::new()?))
+            }
+        },
+        MacosCaptureBackend::Swift => Ok(Box::new(SwiftCapturer::new()?)),
+        MacosCaptureBackend::Scrap => Ok(Box::new(ScrapCapturer::new()?)),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -83,6 +100,37 @@ struct ScrapCapturer {
 }
 
 #[cfg(target_os = "macos")]
+struct SwiftCapturer {
+    handle: *mut c_void,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(target_os = "macos")]
+enum MacosCaptureBackend {
+    Auto,
+    Swift,
+    Scrap,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_capture_backend_from_env() -> MacosCaptureBackend {
+    let raw = crate::config::capture_backend();
+    match raw.to_ascii_lowercase().as_str() {
+        "auto" => MacosCaptureBackend::Auto,
+        "scrap" => MacosCaptureBackend::Scrap,
+        "swift" => MacosCaptureBackend::Swift,
+        _ => {
+            println!(
+                "[server] unknown RW_CAPTURE_BACKEND={}; defaulting to auto",
+                raw
+            );
+            MacosCaptureBackend::Auto
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
@@ -90,8 +138,29 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
+#[link(name = "screen_capture_bridge", kind = "static")]
+unsafe extern "C" {
+    fn rw_sc_create(
+        display_index: u32,
+        out_width: *mut u32,
+        out_height: *mut u32,
+        out_error: *mut *mut c_char,
+    ) -> *mut c_void;
+    fn rw_sc_capture_frame(
+        handle: *mut c_void,
+        timeout_ms: u32,
+        out_length: *mut usize,
+        out_error: *mut *mut c_char,
+    ) -> *mut c_void;
+    fn rw_sc_destroy(handle: *mut c_void);
+    fn rw_sc_free_frame(frame: *mut c_void);
+    fn rw_sc_free_error(error: *mut c_char);
+}
+
+#[cfg(target_os = "macos")]
 fn ensure_macos_screen_capture_access() -> io::Result<()> {
     if unsafe { CGPreflightScreenCaptureAccess() } {
+        println!("[server] screen recording permission already granted");
         return Ok(());
     }
 
@@ -100,12 +169,121 @@ fn ensure_macos_screen_capture_access() -> io::Result<()> {
     if unsafe { CGRequestScreenCaptureAccess() } {
         println!("[server] screen recording permission granted");
         return Ok(());
+    } else {
+        println!("[server] screen recording permission denied");
     }
 
     Err(io::Error::new(
         io::ErrorKind::PermissionDenied,
         "screen recording permission denied; enable Screen Recording for Terminal or VS Code in System Settings -> Privacy & Security -> Screen Recording, then restart the app",
     ))
+}
+
+#[cfg(target_os = "macos")]
+fn take_swift_error(error: *mut c_char) -> io::Error {
+    if error.is_null() {
+        return io::Error::new(
+            io::ErrorKind::Other,
+            "screen capture bridge returned an unknown error",
+        );
+    }
+
+    let message = unsafe { CStr::from_ptr(error) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { rw_sc_free_error(error) };
+
+    let kind = if message.contains("timed out") {
+        io::ErrorKind::TimedOut
+    } else if message.contains("permission") {
+        io::ErrorKind::PermissionDenied
+    } else {
+        io::ErrorKind::Other
+    };
+
+    io::Error::new(kind, message)
+}
+
+#[cfg(target_os = "macos")]
+impl SwiftCapturer {
+    fn new() -> io::Result<Self> {
+        ensure_macos_screen_capture_access()?;
+
+        let mut width = 0_u32;
+        let mut height = 0_u32;
+        let mut error: *mut c_char = std::ptr::null_mut();
+
+        println!("[server] initializing ScreenCaptureKit backend via Swift bridge");
+
+        let handle = unsafe { rw_sc_create(0, &mut width, &mut height, &mut error) };
+        if handle.is_null() {
+            return Err(take_swift_error(error));
+        }
+
+        println!(
+            "[server] ScreenCaptureKit backend initialized successfully at {}x{}",
+            width, height
+        );
+
+        Ok(Self {
+            handle,
+            width,
+            height,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SwiftCapturer {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { rw_sc_destroy(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ScreenCapturer for SwiftCapturer {
+    fn geometry(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn capture_frame(&mut self) -> io::Result<Vec<u32>> {
+        let mut length = 0_usize;
+        let mut error: *mut c_char = std::ptr::null_mut();
+        let frame_ptr = unsafe { rw_sc_capture_frame(self.handle, 250, &mut length, &mut error) };
+
+        if frame_ptr.is_null() {
+            return Err(take_swift_error(error));
+        }
+
+        let expected_length = (self.width as usize) * (self.height as usize) * 4;
+        let frame_bytes = unsafe { std::slice::from_raw_parts(frame_ptr as *const u8, length) };
+
+        if frame_bytes.len() != expected_length {
+            unsafe { rw_sc_free_frame(frame_ptr) };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ScreenCaptureKit frame size mismatch: got {} bytes, expected {}",
+                    frame_bytes.len(),
+                    expected_length
+                ),
+            ));
+        }
+
+        let mut pixels = Vec::with_capacity((self.width * self.height) as usize);
+        for pixel in frame_bytes.chunks_exact(4) {
+            let b = pixel[0] as u32;
+            let g = pixel[1] as u32;
+            let r = pixel[2] as u32;
+            pixels.push((r << 16) | (g << 8) | b);
+        }
+
+        unsafe { rw_sc_free_frame(frame_ptr) };
+        Ok(pixels)
+    }
 }
 
 #[cfg(target_os = "macos")]

@@ -1,37 +1,24 @@
-use fontdue::{Font, FontSettings};
 use minifb::{Key, Scale, Window, WindowOptions};
-use std::convert::TryInto;
-use std::io::ErrorKind;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::env;
+use std::sync::mpsc::{sync_channel, TryRecvError, TrySendError};
 use std::time::Duration;
-use std::{fs, thread};
-use RemoteWindow::Color;
-use RemoteWindow::connection::{create_client_connection, TransportMode, DEFAULT_ADDR};
+use std::thread;
+use RemoteWindow::compression::{create_frame_compression, CompressionKind};
+use RemoteWindow::config;
+use RemoteWindow::connection::{create_client_connection, TransportMode};
 
 fn main() {
     const WIDTH: usize = 1920;
     const HEIGHT: usize = 1080;
-    const CHUNK_SIZE: usize = 600;
 
-    let file = fs::read("./fira_code.ttf".to_string()).unwrap();
-    let font = Font::from_bytes(file, FontSettings::default()).unwrap();
-
-    //Create ArcMutex for screen buffer
-    let screen_buffer = Arc::new(Mutex::new(vec![0; WIDTH * HEIGHT]));
-    //Create ArcAtomicBool for screen buffer update state
-    let screen_updated = Arc::new(AtomicBool::new(false));
-
-    let screen_updated_clone = screen_updated.clone();
-    let screen_buffer_clone = screen_buffer.clone();
+    // Keep only the newest decoded frame to avoid queue buildup under load.
+    let (frame_tx, frame_rx) = sync_channel::<Vec<u32>>(1);
 
     let connection_thread = thread::spawn(move || {
         let mut reconnect_attempts: u64 = 0;
 
         loop {
             let transport = TransportMode::from_env();
-            let server_addr = env::var("RW_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+            let server_addr = config::server_addr();
             println!(
                 "[client/net] connecting to {} using {:?} (attempt #{})",
                 server_addr,
@@ -52,88 +39,135 @@ fn main() {
             println!("[client/net] connected to {}", server_addr);
             let mut frames_received: u64 = 0;
             let mut last_net_log = std::time::Instant::now();
+            let mut active_codec_kind: Option<CompressionKind> = None;
+            let mut active_codec = create_frame_compression(CompressionKind::Lz4);
 
-            'connection_loop: loop {
+            if matches!(transport, TransportMode::Udp) {
                 if let Err(e) = connection.request_frame() {
-                    println!("[client/net] frame request failed: {}", e);
+                    println!("[client/net] UDP registration failed: {}", e);
                     break;
                 }
+            }
 
-                let header = loop {
-                    match connection.read_frame_header() {
-                        Ok(header) => break header,
-                        Err(ref e)
-                            if e.kind() == ErrorKind::WouldBlock
-                                || e.kind() == ErrorKind::TimedOut =>
-                        {
-                            println!("[client/net] waiting for frame header...");
-                            thread::sleep(Duration::from_millis(50));
-                        }
-                        Err(e) => {
-                            println!("Header read error: {}", e);
-                            break 'connection_loop;
-                        }
+            loop {
+                let header = match connection.read_frame_header() {
+                    Ok(header) => header,
+                    Err(e) => {
+                        println!("Header read error: {}", e);
+                        break;
                     }
                 };
 
                 let w = header.width;
                 let h = header.height;
                 let frame_pixel_count = header.pixel_count as usize;
-                let mut rendered_pixel_count: usize = 0;
+                let expected_raw_len = frame_pixel_count * 4;
+                let expected_payload_len = header.payload_len as usize;
+                if active_codec_kind != Some(header.compression) {
+                    active_codec_kind = Some(header.compression);
+                    active_codec = create_frame_compression(header.compression);
+                }
 
-                // Read frame chunks until all expected pixels are consumed.
-                while rendered_pixel_count < frame_pixel_count {
-                    let mut pixel_buffer = [0; CHUNK_SIZE * 4];
-                    let read_size = match connection.read_chunk(&mut pixel_buffer) {
+                let mut payload = vec![0_u8; expected_payload_len];
+                let mut payload_len = 0usize;
+
+                while payload_len < expected_payload_len {
+                    let read_size = match connection.read_chunk(&mut payload[payload_len..]) {
                         Ok(size) => size,
                         Err(e) => {
                             println!("Chunk read error: {}", e);
-                            rendered_pixel_count = 0;
+                            payload_len = 0;
                             break;
                         }
                     };
-                    if read_size % 4 != 0 {
+
+                    if payload_len + read_size > expected_payload_len {
                         println!(
-                            "[client/net] invalid chunk byte size: {} (not multiple of 4)",
-                            read_size
+                            "[client/net] frame payload overflow: got {} + {} bytes, expected {}",
+                            payload_len,
+                            read_size,
+                            expected_payload_len
                         );
-                        rendered_pixel_count = 0;
+                        payload_len = 0;
                         break;
                     }
 
-                    let read_pixels = read_size / 4;
+                    payload_len += read_size;
+                }
 
-                    for chunk in 0..read_pixels {
-                        let u32_buffer: [u8; 4] =
-                            pixel_buffer[chunk * 4..(chunk + 1) * 4].try_into().unwrap();
-                        if frame_pixel_count > (rendered_pixel_count + chunk) {
-                            screen_buffer_clone.lock().unwrap()[rendered_pixel_count + chunk] =
-                                u32::from_le_bytes(u32_buffer);
+                if payload_len == expected_payload_len {
+                    let raw_frame = match active_codec.decompress(&payload, expected_raw_len) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            println!("[client/net] decompression error: {}", e);
+                            break;
+                        }
+                    };
+
+                    if raw_frame.len() != expected_raw_len {
+                        println!(
+                            "[client/net] decoded frame size mismatch: got {} bytes, expected {}",
+                            raw_frame.len(),
+                            expected_raw_len
+                        );
+                        break;
+                    }
+
+                    // Convert bytes to pixels with a bulk copy on little-endian targets.
+                    let buf_len = WIDTH * HEIGHT;
+                    let copy_pixels = frame_pixel_count.min(buf_len);
+                    let mut local_pixels = vec![0_u32; buf_len];
+                    if cfg!(target_endian = "little") {
+                        let byte_len = copy_pixels * 4;
+                        // Safe: both source and destination are valid for byte_len bytes and non-overlapping.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                raw_frame.as_ptr(),
+                                local_pixels.as_mut_ptr() as *mut u8,
+                                byte_len,
+                            );
+                        }
+                    } else {
+                        for (dst, pixel_bytes) in local_pixels
+                            .iter_mut()
+                            .zip(raw_frame.chunks_exact(4).take(copy_pixels))
+                        {
+                            *dst = u32::from_le_bytes([
+                                pixel_bytes[0],
+                                pixel_bytes[1],
+                                pixel_bytes[2],
+                                pixel_bytes[3],
+                            ]);
                         }
                     }
 
-                    rendered_pixel_count += read_pixels;
-                }
+                    match frame_tx.try_send(local_pixels) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            // UI hasn't consumed previous frame yet; drop this one.
+                        }
+                        Err(TrySendError::Disconnected(_)) => return,
+                    }
 
-                if rendered_pixel_count == frame_pixel_count {
                     frames_received += 1;
-                    screen_updated_clone.store(true, Ordering::Relaxed);
 
                     if last_net_log.elapsed().as_secs_f32() >= 1.0 {
                         println!(
-                            "[client/net] receiving frames ok: {} fps, last frame {}x{}",
+                            "[client/net] receiving frames ok: {} fps, last frame {}x{}, codec={}, payload={} bytes",
                             frames_received,
                             w,
-                            h
+                            h,
+                            header.compression.name(),
+                            expected_payload_len
                         );
                         frames_received = 0;
                         last_net_log = std::time::Instant::now();
                     }
                 } else {
                     println!(
-                        "[client/net] dropped incomplete frame: got {} / {} pixels",
-                        rendered_pixel_count,
-                        frame_pixel_count
+                        "[client/net] dropped incomplete frame payload: got {} / {} bytes",
+                        payload_len,
+                        expected_payload_len
                     );
                     break;
                 }
@@ -163,104 +197,45 @@ fn main() {
     let mut fps = 0;
     let mut last_ui_log = std::time::Instant::now();
     let mut waiting_since = std::time::Instant::now();
+    let mut present_buffer = vec![0_u32; WIDTH * HEIGHT];
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        // If screen updated read from buffer.
-        if screen_updated.load(Ordering::Relaxed) {
+        let mut got_new_frame = false;
+        loop {
+            match frame_rx.try_recv() {
+                Ok(frame) => {
+                    present_buffer = frame;
+                    got_new_frame = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+
+        if got_new_frame {
             waiting_since = std::time::Instant::now();
-            match screen_buffer.try_lock() {
-                Ok(mut screen_buffer) => {
-                    // Update buffer from window.
+            rendered_frames += 1;
+            if last_draw.elapsed().as_secs_f32() > 1.0 {
+                fps = rendered_frames;
+                rendered_frames = 0;
+                last_draw = std::time::Instant::now();
+                window.set_title(format!("RemoteWindow - FPS {}", fps).as_str());
+            }
 
-                    let color = Color::green();
-                    let background_color = Color::from_rgb(0, 0, 0);
-                    let font_size = 33;
+            window
+                .update_with_buffer(&present_buffer, WIDTH, HEIGHT)
+                .unwrap();
 
-                    let mut put_pixel = |x: usize, y: usize, color: Color| {
-                        screen_buffer[y * WIDTH + x] = color.to_hex_rgb();
-                    };
-
-                    let mut draw_char = |chr: char, x: usize, y: usize| {
-                        let (metrics, bitmap) = font.rasterize(chr, font_size as f32);
-                        let mut current_x = x;
-                        let mut current_y = y;
-
-                        for y in 0..metrics.height {
-                            for x in 0..metrics.width {
-                                let char_s = bitmap[x + y * metrics.width];
-
-                                let mut char_color = Color::from_rgb(
-                                    char_s as u32,
-                                    char_s as u32,
-                                    char_s as u32,
-                                );
-
-                                if char_color.red != 0
-                                    && char_color.green != 0
-                                    && char_color.blue != 0
-                                {
-                                    char_color = color
-                                } else if char_color.red == 0
-                                    && char_color.green == 0
-                                    && char_color.blue == 0
-                                {
-                                    char_color = background_color;
-                                }
-
-                                put_pixel(
-                                    current_x,
-                                    current_y
-                                        + ((metrics.ymin * -1) as usize)
-                                        + (if (font_size as usize) < metrics.height {
-                                            0
-                                        } else {
-                                            (font_size as usize) - metrics.height
-                                        }),
-                                    char_color,
-                                );
-
-                                current_x += 1;
-                            }
-                            current_y += 1;
-                            current_x = x;
-                        }
-                    };
-
-                    let mut draw_string = |string: &str, x: usize, y: usize| {
-                        let mut current_x = x;
-                        let current_y = y;
-                        for chr in string.chars() {
-                            draw_char(chr, current_x, current_y);
-                            current_x += 16;
-                        }
-                    };
-
-                    rendered_frames += 1;
-                    if last_draw.elapsed().as_secs_f32() > 1.0 {
-                        fps = rendered_frames;
-                        rendered_frames = 0;
-                        last_draw = std::time::Instant::now();
-                    }
-
-                    draw_string(format!("FPS: {}", fps).as_str(), 0, 0);
-
-                    window
-                        .update_with_buffer(&screen_buffer, WIDTH, HEIGHT)
-                        .unwrap();
-                    screen_updated.store(false, Ordering::Relaxed);
-
-                    if last_ui_log.elapsed().as_secs_f32() >= 1.0 {
-                        println!("[client/ui] presenting frames: {} fps", fps);
-                        last_ui_log = std::time::Instant::now();
-                    }
-                }
-                Err(_) => {
-                    println!("LOCK ERROR");
-                }
+            if last_ui_log.elapsed().as_secs_f32() >= 5.0 {
+                println!("[client/ui] presenting frames: {} fps", fps);
+                last_ui_log = std::time::Instant::now();
             }
         } else if waiting_since.elapsed().as_secs_f32() >= 2.0 {
             println!("[client/ui] waiting for next frame update...");
             waiting_since = std::time::Instant::now();
+            window.update();
+        } else {
+            window.update();
         }
     }
 

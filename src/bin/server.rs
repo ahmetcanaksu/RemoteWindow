@@ -1,16 +1,32 @@
 use RemoteWindow::capture::{create_default_capturer, ScreenCapturer};
+use RemoteWindow::compression::{create_frame_compression_from_env, FrameCompression};
+use RemoteWindow::config;
 use RemoteWindow::connection::{
     bind_tcp_listener, ServerConnection, TcpServerConnection, TransportMode, UdpServerConnection,
-    DEFAULT_ADDR,
 };
 use std::{
-    env,
+    mem,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-const CHUNK_SIZE: usize = 600;
-const CHUNK_BYTES: usize = CHUNK_SIZE * 4;
+const TCP_CHUNK_BYTES: usize = 65_534; // just under u16::MAX
+const UDP_CHUNK_BYTES: usize = 1_200; // safe payload to avoid IP fragmentation
+
+fn pixels_as_le_bytes<'a>(pixels: &'a [u32], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    if cfg!(target_endian = "little") {
+        let byte_len = mem::size_of_val(pixels);
+        // Safe: u32 buffer is contiguous, properly aligned, and we only reinterpret as bytes.
+        unsafe { std::slice::from_raw_parts(pixels.as_ptr() as *const u8, byte_len) }
+    } else {
+        scratch.clear();
+        scratch.reserve(pixels.len() * 4);
+        for &rgb in pixels {
+            scratch.extend_from_slice(&rgb.to_le_bytes());
+        }
+        scratch.as_slice()
+    }
+}
 
 fn create_capturer_blocking() -> std::io::Result<Box<dyn ScreenCapturer>> {
     loop {
@@ -37,44 +53,51 @@ fn create_capturer_blocking() -> std::io::Result<Box<dyn ScreenCapturer>> {
 fn handle_connection(
     connection: &mut dyn ServerConnection,
     capturer: &mut dyn ScreenCapturer,
+    compression: &dyn FrameCompression,
     (w, h): (u32, u32),
 ) -> std::io::Result<()> {
     let mut frames_sent: u64 = 0;
     let mut last_log = std::time::Instant::now();
+    let mut raw_frame_scratch = Vec::new();
 
+    let frame_interval = Duration::from_millis(config::frame_interval_ms());
     loop {
-        connection.wait_for_frame_request()?;
-        thread::sleep(Duration::from_millis(80));
+        let frame_start = Instant::now();
 
         let pixels = capturer.capture_frame()?;
         let pixel_count = pixels.len() as u32;
-        connection.send_frame_header(w, h, pixel_count)?;
+        let raw_frame = pixels_as_le_bytes(&pixels, &mut raw_frame_scratch);
 
-        // Stream exact byte chunks. TCP adds length prefix in transport layer.
-        let mut chunk = Vec::with_capacity(CHUNK_BYTES);
+        let payload = compression.compress(raw_frame)?;
+        connection.send_frame_header(
+            w,
+            h,
+            pixel_count,
+            payload.len() as u32,
+            compression.kind(),
+        )?;
 
-        for rgb in pixels {
-            chunk.extend_from_slice(&rgb.to_le_bytes());
-
-            if chunk.len() == CHUNK_BYTES {
-                connection.send_chunk(&chunk)?;
-                chunk.clear();
-            }
+        for chunk in payload.chunks(TCP_CHUNK_BYTES) {
+            connection.send_chunk(chunk)?;
         }
 
-        if !chunk.is_empty() {
-            connection.send_chunk(&chunk)?;
+        // pace: sleep only the remaining time in this frame's interval
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_interval {
+            thread::sleep(frame_interval - elapsed);
         }
 
         frames_sent += 1;
-        if last_log.elapsed().as_secs_f32() >= 1.0 {
+        if last_log.elapsed().as_secs_f32() >= 5.0 {
             println!(
-                "[server] peer={} streaming ok: {} fps, frame={}x{}, pixels={}",
+                "[server] peer={} streaming ok: {} fps, frame={}x{}, pixels={}, codec={}, payload={} bytes",
                 connection.peer_label(),
                 frames_sent,
                 w,
                 h,
-                pixel_count
+                pixel_count,
+                compression.kind().name(),
+                payload.len()
             );
             frames_sent = 0;
             last_log = std::time::Instant::now();
@@ -84,8 +107,10 @@ fn handle_connection(
 
 fn run_tcp_server(bind_addr: &str) -> std::io::Result<()> {
     let mut capturer = create_capturer_blocking()?;
+    let compression = create_frame_compression_from_env();
     let listener = bind_tcp_listener(bind_addr)?;
     println!("TCP server listening on {}", bind_addr);
+    println!("[server] frame compression: {}", compression.kind().name());
     println!("[server] waiting for incoming TCP connections...");
 
     for stream in listener.incoming() {
@@ -101,7 +126,7 @@ fn run_tcp_server(bind_addr: &str) -> std::io::Result<()> {
                     h
                 );
 
-                match handle_connection(&mut connection, capturer.as_mut(), (w, h)) {
+                match handle_connection(&mut connection, capturer.as_mut(), compression.as_ref(), (w, h)) {
                     Ok(_) => println!("Connection closed: {}", connection.peer_label()),
                     Err(e) => println!(
                         "[server] stream ended for {}: {}",
@@ -123,43 +148,92 @@ fn run_tcp_server(bind_addr: &str) -> std::io::Result<()> {
 
 fn run_udp_server(bind_addr: &str) -> std::io::Result<()> {
     let mut capturer = create_capturer_blocking()?;
+    let compression = create_frame_compression_from_env();
     let mut connection = UdpServerConnection::bind(bind_addr)?;
+    let frame_interval = Duration::from_millis(config::frame_interval_ms());
+    let mut frames_sent: u64 = 0;
+    let mut last_log = Instant::now();
+    let mut raw_frame_scratch = Vec::new();
 
     println!("UDP server listening on {}", bind_addr);
+    println!("[server] frame compression: {}", compression.kind().name());
     loop {
+        println!("[server] waiting for UDP client registration...");
         connection.wait_for_frame_request()?;
-        let (w, h) = capturer.geometry();
+        println!("[server] UDP client registered: {}", connection.peer_label());
 
-        let pixels = match capturer.capture_frame() {
-            Ok(frame) => frame,
-            Err(e) => {
-                println!("Capture failed: {:?}", e);
-                capturer = create_capturer_blocking()?;
-                continue;
+        loop {
+            let frame_start = Instant::now();
+            let (w, h) = capturer.geometry();
+
+            let pixels = match capturer.capture_frame() {
+                Ok(frame) => frame,
+                Err(e) => {
+                    println!("Capture failed: {:?}", e);
+                    capturer = create_capturer_blocking()?;
+                    break;
+                }
+            };
+            let pixel_count = pixels.len() as u32;
+            let raw_frame = pixels_as_le_bytes(&pixels, &mut raw_frame_scratch);
+            let payload = compression.compress(raw_frame)?;
+
+            if let Err(e) = connection.send_frame_header(
+                w,
+                h,
+                pixel_count,
+                payload.len() as u32,
+                compression.kind(),
+            ) {
+                println!("[server] UDP header send failed for {}: {}", connection.peer_label(), e);
+                break;
             }
-        };
-        connection.send_frame_header(w, h, pixels.len() as u32)?;
 
-        let mut chunk = Vec::with_capacity(CHUNK_BYTES);
-
-        for rgb in pixels {
-            chunk.extend_from_slice(&rgb.to_le_bytes());
-
-            if chunk.len() == CHUNK_BYTES {
-                connection.send_chunk(&chunk)?;
-                chunk.clear();
+            let mut send_failed = false;
+            for chunk in payload.chunks(UDP_CHUNK_BYTES) {
+                if let Err(e) = connection.send_chunk(chunk) {
+                    println!(
+                        "[server] UDP chunk send failed for {}: {}",
+                        connection.peer_label(),
+                        e
+                    );
+                    send_failed = true;
+                    break;
+                }
             }
-        }
 
-        if !chunk.is_empty() {
-            connection.send_chunk(&chunk)?;
+            if send_failed {
+                break;
+            }
+
+            frames_sent += 1;
+            if last_log.elapsed().as_secs_f32() >= 5.0 {
+                println!(
+                    "[server] peer={} streaming ok: {} fps, frame={}x{}, pixels={}, codec={}, payload={} bytes",
+                    connection.peer_label(),
+                    frames_sent,
+                    w,
+                    h,
+                    pixel_count,
+                    compression.kind().name(),
+                    payload.len()
+                );
+                frames_sent = 0;
+                last_log = Instant::now();
+            }
+
+            let elapsed = frame_start.elapsed();
+            if elapsed < frame_interval {
+                thread::sleep(frame_interval - elapsed);
+            }
         }
     }
 }
 
 fn main() {
+    config::print_config();
     let transport = TransportMode::from_env();
-    let bind_addr = env::var("RW_BIND_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+    let bind_addr = config::bind_addr();
 
     let result = match transport {
         TransportMode::Tcp => run_tcp_server(&bind_addr),

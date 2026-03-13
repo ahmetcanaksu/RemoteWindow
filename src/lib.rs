@@ -1,4 +1,6 @@
 pub mod capture;
+pub mod compression;
+pub mod config;
 pub mod connection;
 
 #[derive(Copy, Clone, Debug)]

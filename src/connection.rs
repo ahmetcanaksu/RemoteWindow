@@ -1,6 +1,7 @@
-use std::env;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+
+use crate::compression::CompressionKind;
 
 pub const FRAME_REQUEST: u8 = 0x88;
 pub const FRAME_MAGIC: [u8; 4] = [0x33, 0x34, 0x35, 0x36];
@@ -12,6 +13,8 @@ pub struct FrameHeader {
     pub width: u32,
     pub height: u32,
     pub pixel_count: u32,
+    pub payload_len: u32,
+    pub compression: CompressionKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,7 +26,7 @@ pub enum TransportMode {
 
 impl TransportMode {
     pub fn from_env() -> Self {
-        let raw = env::var("RW_TRANSPORT").unwrap_or_else(|_| "tcp".to_string());
+        let raw = crate::config::transport();
         Self::from_str(&raw).unwrap_or(Self::Tcp)
     }
 
@@ -90,14 +93,28 @@ impl ClientConnection for TcpClientConnection {
         let mut w_buffer = [0_u8; 4];
         let mut h_buffer = [0_u8; 4];
         let mut pixel_count_buffer = [0_u8; 4];
+        let mut payload_len_buffer = [0_u8; 4];
+        let mut compression_buffer = [0_u8; 4];
         self.stream.read_exact(&mut w_buffer)?;
         self.stream.read_exact(&mut h_buffer)?;
         self.stream.read_exact(&mut pixel_count_buffer)?;
+        self.stream.read_exact(&mut payload_len_buffer)?;
+        self.stream.read_exact(&mut compression_buffer)?;
+
+        let compression_raw = u32::from_le_bytes(compression_buffer);
+        let compression = CompressionKind::from_id(compression_raw).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown compression codec id: {}", compression_raw),
+            )
+        })?;
 
         Ok(FrameHeader {
             width: u32::from_le_bytes(w_buffer),
             height: u32::from_le_bytes(h_buffer),
             pixel_count: u32::from_le_bytes(pixel_count_buffer),
+            payload_len: u32::from_le_bytes(payload_len_buffer),
+            compression,
         })
     }
 
@@ -137,9 +154,9 @@ impl ClientConnection for UdpClientConnection {
     }
 
     fn read_frame_header(&mut self) -> io::Result<FrameHeader> {
-        let mut packet = [0_u8; 16];
+        let mut packet = [0_u8; 24];
         let size = self.socket.recv(&mut packet)?;
-        if size < 16 {
+        if size < 24 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "short UDP frame header",
@@ -156,14 +173,28 @@ impl ClientConnection for UdpClientConnection {
         let mut w_buffer = [0_u8; 4];
         let mut h_buffer = [0_u8; 4];
         let mut pixel_count_buffer = [0_u8; 4];
+        let mut payload_len_buffer = [0_u8; 4];
+        let mut compression_buffer = [0_u8; 4];
         w_buffer.copy_from_slice(&packet[4..8]);
         h_buffer.copy_from_slice(&packet[8..12]);
         pixel_count_buffer.copy_from_slice(&packet[12..16]);
+        payload_len_buffer.copy_from_slice(&packet[16..20]);
+        compression_buffer.copy_from_slice(&packet[20..24]);
+
+        let compression_raw = u32::from_le_bytes(compression_buffer);
+        let compression = CompressionKind::from_id(compression_raw).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown compression codec id: {}", compression_raw),
+            )
+        })?;
 
         Ok(FrameHeader {
             width: u32::from_le_bytes(w_buffer),
             height: u32::from_le_bytes(h_buffer),
             pixel_count: u32::from_le_bytes(pixel_count_buffer),
+            payload_len: u32::from_le_bytes(payload_len_buffer),
+            compression,
         })
     }
 
@@ -174,7 +205,14 @@ impl ClientConnection for UdpClientConnection {
 
 pub trait ServerConnection {
     fn wait_for_frame_request(&mut self) -> io::Result<()>;
-    fn send_frame_header(&mut self, w: u32, h: u32, pixel_count: u32) -> io::Result<()>;
+    fn send_frame_header(
+        &mut self,
+        w: u32,
+        h: u32,
+        pixel_count: u32,
+        payload_len: u32,
+        compression: CompressionKind,
+    ) -> io::Result<()>;
     fn send_chunk(&mut self, chunk: &[u8]) -> io::Result<()>;
     fn peer_label(&self) -> String;
 }
@@ -185,6 +223,7 @@ pub struct TcpServerConnection {
 
 impl TcpServerConnection {
     pub fn new(stream: TcpStream) -> Self {
+        stream.set_nodelay(true).ok();
         Self { stream }
     }
 }
@@ -202,12 +241,22 @@ impl ServerConnection for TcpServerConnection {
         Ok(())
     }
 
-    fn send_frame_header(&mut self, w: u32, h: u32, pixel_count: u32) -> io::Result<()> {
-        self.stream.write_all(&FRAME_MAGIC)?;
-        self.stream.write_all(&w.to_le_bytes())?;
-        self.stream.write_all(&h.to_le_bytes())?;
-        self.stream.write_all(&pixel_count.to_le_bytes())?;
-        self.stream.flush()
+    fn send_frame_header(
+        &mut self,
+        w: u32,
+        h: u32,
+        pixel_count: u32,
+        payload_len: u32,
+        compression: CompressionKind,
+    ) -> io::Result<()> {
+        let mut buf = [0u8; 24];
+        buf[0..4].copy_from_slice(&FRAME_MAGIC);
+        buf[4..8].copy_from_slice(&w.to_le_bytes());
+        buf[8..12].copy_from_slice(&h.to_le_bytes());
+        buf[12..16].copy_from_slice(&pixel_count.to_le_bytes());
+        buf[16..20].copy_from_slice(&payload_len.to_le_bytes());
+        buf[20..24].copy_from_slice(&compression.id().to_le_bytes());
+        self.stream.write_all(&buf)
     }
 
     fn send_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
@@ -219,9 +268,10 @@ impl ServerConnection for TcpServerConnection {
         }
 
         let len = chunk.len() as u16;
-        self.stream.write_all(&len.to_le_bytes())?;
-        self.stream.write_all(chunk)?;
-        self.stream.flush()
+        let mut buf = Vec::with_capacity(2 + chunk.len());
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(chunk);
+        self.stream.write_all(&buf)
     }
 
     fn peer_label(&self) -> String {
@@ -256,16 +306,25 @@ impl ServerConnection for UdpServerConnection {
         }
     }
 
-    fn send_frame_header(&mut self, w: u32, h: u32, pixel_count: u32) -> io::Result<()> {
+    fn send_frame_header(
+        &mut self,
+        w: u32,
+        h: u32,
+        pixel_count: u32,
+        payload_len: u32,
+        compression: CompressionKind,
+    ) -> io::Result<()> {
         let peer = self
             .peer
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "missing UDP peer"))?;
 
-        let mut packet = [0_u8; 16];
+        let mut packet = [0_u8; 24];
         packet[0..4].copy_from_slice(&FRAME_MAGIC);
         packet[4..8].copy_from_slice(&w.to_le_bytes());
         packet[8..12].copy_from_slice(&h.to_le_bytes());
         packet[12..16].copy_from_slice(&pixel_count.to_le_bytes());
+        packet[16..20].copy_from_slice(&payload_len.to_le_bytes());
+        packet[20..24].copy_from_slice(&compression.id().to_le_bytes());
         self.socket.send_to(&packet, peer)?;
         Ok(())
     }
