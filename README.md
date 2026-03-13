@@ -6,7 +6,7 @@ A window sharer app shares window over network.
 
 ## Whats missing?
 
-- Compression of packages is required its (512 * 4) per package. Higher package size will increase fps but pacakge losses will occur more.
+- Compression of packages is required its (512 * 4) per package. Higher package size will increase fps but package losses will occur more.
 
 - Screen recorder library maybe not the greatest choice, it will error out sometimes even waiting for 80ms
 
