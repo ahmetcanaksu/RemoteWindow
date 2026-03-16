@@ -1,5 +1,5 @@
 [package]
-name = "RemoteWindow"
+name = "remote_window"
 version = "0.1.0"
 authors = ["Ahmetcan AKSU <ahmetcanco@gmail.com>"]
 edition = "2018"
@@ -13,10 +13,18 @@ edition = "2018"
 #repng = "0.2.2"
 #captrs = "0.3.1"
 fontdue = "0.7.3"
+lz4_flex = "0.11"
 rand = "0.8.5"
 minifb = "0.25.0"
-captrs="0.3.1"
 zstd = "0.12"
+arc-swap = "1.8.2"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+captrs = "0.3.1"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+scrap = "0.5"
 
 [[bin]]
 name = "client"

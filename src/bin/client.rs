@@ -13,7 +13,7 @@ fn main() {
     const HEIGHT: usize = 1080;
     const CHUNK_SIZE: usize = 600;
 
-    let file = fs::read("./fira_code.ttf".to_string()).unwrap();
+    let file: Vec<u8> = fs::read("./fira_code.ttf".to_string()).unwrap();
     let font = Font::from_bytes(file, FontSettings::default()).unwrap();
 
     //Create ArcMutex for screen buffer
