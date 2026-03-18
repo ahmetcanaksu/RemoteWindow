@@ -1,7 +1,7 @@
 use std::{thread, time::Duration};
 
 use remote_window::{
-    capture::{create_default_capturer, ScreenCapturer},
+    capture::{create_default_capturer, get_monitor_list, ScreenCapturer},
     compression::{FrameCompression, ZstdCompression},
 };
 
@@ -65,80 +65,6 @@ fn compress_frames(pixels: &[u32]) -> Vec<u8> {
 }
 
 fn main() {
-    let mut capturer = create_capturer_blocking().unwrap();
-
-    let frame = capturer.capture_frame().unwrap();
-
-    let chunk_frame_timer = std::time::Instant::now();
-    let compressed_chunk_frame = compress_frames_with_chunk(&frame, 3000);
-    println!(
-        "Compressed frame with chunking in {:?}, size: {} bytes",
-        chunk_frame_timer.elapsed(),
-        compressed_chunk_frame.len()
-    );
-
-    let full_frame_timer = std::time::Instant::now();
-    let compressed_full_frame = compress_frames(&frame);
-    println!(
-        "Compressed full frame in {:?}, size: {} bytes",
-        full_frame_timer.elapsed(),
-        compressed_full_frame.len()
-    );
-
-    if compressed_chunk_frame.len() < compressed_full_frame.len() {
-        println!(
-            "Chunked compression resulted in smaller size by {} bytes {} bytes in total",
-            compressed_full_frame.len() - compressed_chunk_frame.len(),
-            compressed_chunk_frame.len()
-        );
-    } else if compressed_full_frame.len() < compressed_chunk_frame.len() {
-        println!(
-            "Full frame compression resulted in smaller size by {} bytes {} bytes in total",
-            compressed_chunk_frame.len() - compressed_full_frame.len(),
-            compressed_full_frame.len()
-        );
-    } else {
-        println!("Both compression methods resulted in the same size");
-    }
-
-    if full_frame_timer.elapsed() < chunk_frame_timer.elapsed() {
-        println!(
-            "Full frame compression was faster by {:?}",
-            chunk_frame_timer.elapsed() - full_frame_timer.elapsed()
-        );
-    } else if chunk_frame_timer.elapsed() < full_frame_timer.elapsed() {
-        println!(
-            "Chunked compression was faster by {:?}",
-            full_frame_timer.elapsed() - chunk_frame_timer.elapsed()
-        );
-    } else {
-        println!("Both compression methods took the same time");
-    }
-
-    /*     println!("Captured frame with {} pixels", frame.len());
-       println!("First 10 pixels: {:?}", &frame[..10]);
-       println!("First 10 pixels as little-endian bytes: {:?}", frame[..10].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
-
-       let ztsdCompressed =
-           ZstdCompression::with_level(3)
-           .compress(
-               frame[..10].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>().as_slice()
-           ).unwrap();
-
-       println!("Zstd compressed first 10 pixels ({} bytes): {:?}", ztsdCompressed.len(), ztsdCompressed);
-    */
-    /* let listener = TcpListener::bind("localhost:80");
-    if let Ok(socket) = listener {
-        for stream in socket.incoming() {
-            match stream {
-                Err(e) => println!("Accept err {}", e),
-                Ok(stream) => {
-                    thread::spawn(|| handle_client(stream));
-                }
-            }
-            //handle_client(stream.unwrap());
-        }
-    } else if let Err(error) = listener {
-        println!("Failed to bind server: {:#?}", error);
-    } */
+    let displays = get_monitor_list();
+    println!("Detected displays: {:#?}", displays);
 }

@@ -55,7 +55,7 @@ fn main() {
         let mut connection = UdpClientConnection::connect(&server_addr).unwrap();
         connection
             .socket
-            .set_read_timeout(Some(Duration::from_millis(100)))
+            .set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
 
         let mut frame_count = 0;

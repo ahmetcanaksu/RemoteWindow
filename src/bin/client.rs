@@ -1,19 +1,19 @@
 use fontdue::{Font, FontSettings};
 use minifb::{Key, Scale, Window, WindowOptions};
+use remote_window::color::Color;
 use std::convert::TryInto;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{fs, thread};
 use std::{io::Read, net::TcpStream};
-use RemoteWindow::Color;
 
 fn main() {
     const WIDTH: usize = 1920;
     const HEIGHT: usize = 1080;
     const CHUNK_SIZE: usize = 600;
 
-    let file: Vec<u8> = fs::read("./fira_code.ttf".to_string()).unwrap();
+    let file: Vec<u8> = fs::read("./font.ttf".to_string()).unwrap();
     let font = Font::from_bytes(file, FontSettings::default()).unwrap();
 
     //Create ArcMutex for screen buffer
@@ -30,7 +30,7 @@ fn main() {
         let mut w = 0;
         let mut h = 0;
 
-        let mut socket = TcpStream::connect("127.0.0.1:82").unwrap();
+        let mut socket = TcpStream::connect("127.0.0.1:8080").unwrap();
         // Notify server for frame render.
         socket.write(&[0x88]).unwrap();
 
