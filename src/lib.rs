@@ -4,3 +4,7 @@ pub mod compression;
 pub mod config;
 pub mod connection;
 pub mod connection_handler;
+pub mod cursor;
+pub mod screen;
+pub mod performance_track;
+pub mod dxgi_capturer;

@@ -4,13 +4,22 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=swift/ScreenCaptureBridge.swift");
 
-    if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() != Some("macos") {
-        return;
+    if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("macos") {
+        println!("cargo:rerun-if-changed=swift/ScreenCaptureBridge.swift");
+        build_swift_bridge();
+    } else if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("windows") {
+        println!("cargo:rerun-if-changed=manifest.xml");
+        println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+
+        println!(
+            "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
+            std::path::Path::new("manifest.xml")
+                .canonicalize()
+                .unwrap()
+                .display()
+        );
     }
-
-    build_swift_bridge();
 }
 
 fn build_swift_bridge() {

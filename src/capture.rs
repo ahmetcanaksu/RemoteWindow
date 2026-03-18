@@ -2,6 +2,11 @@ use std::io;
 
 #[cfg(target_os = "macos")]
 use std::ffi::{c_char, c_void, CStr};
+use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+};
+use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 
 pub trait ScreenCapturer {
     fn geometry(&self) -> (u32, u32);
@@ -352,4 +357,75 @@ impl ScreenCapturer for ScrapCapturer {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MonitorData {
+    pub name: String,
+    pub width: i32,
+    pub height: i32,
+    pub is_primary: bool,
+    pub x: i32,
+    pub y: i32,
+}
+
+pub fn get_monitors() -> Vec<MonitorData> {
+    let mut monitors = Vec::new();
+
+    unsafe {
+        // We pass a pointer to our Vec as the LPARAM so the callback can fill it
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(monitor_enum_proc),
+            LPARAM(&mut monitors as *mut Vec<MonitorData> as isize),
+        );
+    }
+
+    monitors
+}
+
+unsafe extern "system" fn monitor_enum_proc(
+    hmonitor: HMONITOR,
+    _: HDC,
+    _: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
+    let monitors = &mut *(lparam.0 as *mut Vec<MonitorData>);
+
+    // We use MONITORINFOEXW to also get the device name (like "\\.\DISPLAY1")
+    let mut info = MONITORINFOEXW {
+        monitorInfo: MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    if GetMonitorInfoW(hmonitor, &mut info.monitorInfo).as_bool() {
+        let r = info.monitorInfo.rcMonitor;
+
+        // Check if this is the DEFAULT (Primary) monitor
+        // Correct way to check the flag
+        let is_primary = (info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0;
+        monitors.push(MonitorData {
+            name: String::from_utf16_lossy(&info.szDevice)
+                .trim_matches(char::from(0))
+                .to_string(),
+            width: r.right - r.left,
+            height: r.bottom - r.top,
+            is_primary,
+            x: r.left,
+            y: r.top,
+        });
+    }
+
+    BOOL::from(true)
+}
+
+pub fn getSystemMonitors() -> Vec<(u32, u32, i32, i32)> {
+    get_monitors()
+        .into_iter()
+        .map(|m| (m.width as u32, m.height as u32, m.x, m.y))
+        .collect()
 }

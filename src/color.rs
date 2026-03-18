@@ -53,4 +53,8 @@ impl Color {
     pub fn to_hex_rgba(&self) -> u32 {
         (self.red << 16) | (self.green << 8) | self.blue | self.alpha
     }
+
+    pub fn to_u32_argb(&self) -> u32 {
+        (self.alpha << 24) | (self.red << 16) | (self.green << 8) | self.blue
+    }
 }

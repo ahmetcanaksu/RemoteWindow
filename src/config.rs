@@ -14,6 +14,8 @@
 /// | RW_FPS_CAP            | 30               | positive integer                        |
 use std::env;
 
+use crate::cursor::Cursor;
+
 pub const DEFAULT_ADDR: &str = "127.0.0.1:8082";
 pub const DEFAULT_FPS_CAP: u32 = 60;
 pub const DEFAULT_TRANSPORT: &str = "udp";
@@ -71,4 +73,17 @@ pub fn print_config() {
         fps_cap(),
         frame_interval_ms()
     );
+}
+
+pub fn print_config_to_cursor(cursor: &mut Cursor) {
+    cursor.println(&format!("RW_BIND_ADDR       = {}", bind_addr()));
+    cursor.println(&format!("RW_SERVER_ADDR     = {}", server_addr()));
+    cursor.println(&format!("RW_TRANSPORT       = {}", transport()));
+    cursor.println(&format!("RW_COMPRESSION     = {}", compression()));
+    cursor.println(&format!("RW_CAPTURE_BACKEND = {}", capture_backend()));
+    cursor.println(&format!(
+        "RW_FPS_CAP         = {} fps ({} ms/frame)",
+        fps_cap(),
+        frame_interval_ms()
+    ));
 }

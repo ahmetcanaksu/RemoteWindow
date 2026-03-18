@@ -1,4 +1,5 @@
 use bytemuck::{Pod, Zeroable};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 
@@ -19,6 +20,7 @@ pub struct FrameHeader {
     pub pixel_count: u32, // 4 bytes
     pub payload_len: u32, // 4 bytes
     pub compression: u32, // 4 bytes
+    pub server_fps: u32,   // 4 bytes
 } // Total: 24 bytes
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,9 +161,18 @@ pub struct UdpClientConnection {
 
 impl UdpClientConnection {
     pub fn connect(addr: &str) -> io::Result<Self> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
-        socket.connect(addr)?;
-        Ok(Self { socket })
+        // Instead of UdpSocket::bind, use socket2 to configure the buffer
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_recv_buffer_size(30 * 1024 * 1024)?; // 30MB buffer
+        let connection_socket: std::net::UdpSocket = socket.into();
+
+        //let socket = UdpSocket::bind("0.0.0.0:0")?;
+        //socket.connect(addr)?;
+
+        connection_socket.connect(addr)?;
+        Ok(Self {
+            socket: connection_socket,
+        })
     }
 }
 
@@ -172,9 +183,9 @@ impl ClientConnection for UdpClientConnection {
     }
 
     fn read_frame_header(&mut self) -> io::Result<FrameHeader> {
-        let mut packet = [0_u8; 24];
+        let mut packet = [0_u8; std::mem::size_of::<FrameHeader>()];
         let size = self.socket.recv(&mut packet)?;
-        if size < 24 {
+        if size < packet.len() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "short UDP frame header",
@@ -205,6 +216,7 @@ pub trait ServerConnection {
         pixel_count: u32,
         payload_len: u32,
         compression: CompressionKind,
+        server_fps: u32,
     ) -> io::Result<()>;
     fn send_chunk(&mut self, chunk: &[u8]) -> io::Result<()>;
     fn peer_label(&self) -> String;
@@ -241,6 +253,7 @@ impl ServerConnection for TcpServerConnection {
         pixel_count: u32,
         payload_len: u32,
         compression: CompressionKind,
+        server_fps: u32,
     ) -> io::Result<()> {
         let mut buf = [0u8; 24];
         buf[0..4].copy_from_slice(&FRAME_MAGIC);
@@ -306,6 +319,7 @@ impl ServerConnection for UdpServerConnection {
         pixel_count: u32,
         payload_len: u32,
         compression: CompressionKind,
+        server_fps: u32,
     ) -> io::Result<()> {
         let header = FrameHeader {
             magic: FRAME_MAGIC,
@@ -314,6 +328,7 @@ impl ServerConnection for UdpServerConnection {
             pixel_count,
             payload_len,
             compression: compression.id(),
+            server_fps, // Include the server FPS in the header
         };
         let packet = bytemuck::bytes_of(&header);
         self.socket.send_to(

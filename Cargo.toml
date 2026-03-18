@@ -19,12 +19,27 @@ minifb = "0.25.0"
 zstd = "0.12"
 arc-swap = "1.8.2"
 bytemuck = { version = "1.25.0", features = ["derive"] }
+socket2 = "0.6.3"
+image = "0.25.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 captrs = "0.3.1"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 scrap = "0.5"
+
+[dependencies.windows]
+version = "0.52"
+features = [
+    "Win32_Graphics_Gdi",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D",
+]
 
 [[bin]]
 name = "client"
